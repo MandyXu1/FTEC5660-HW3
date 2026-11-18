@@ -174,10 +174,54 @@ names and wording, and scores your 3 points only.
 > to students: this is your report, see the homework description.
 
 ### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+>Point 4: Does the company have an above-average sales organization?
+
+Why I chose it: Fisher emphasizes that even the best products cannot sell themselves. A robust sales organization is often the bridge between a company's R&D and its actual market success.
+
+My PASS rule: PASS if the customer provides any positive feedback (even mild) indicating the sales team is knowledgeable, helpful, or provides good advice; FAIL only if there is clear criticism (e.g., they just send price lists or lack technical knowledge).
+
+Evidence it uses: The interview tool, specifically querying a "customer" about the "sales_team".
+
+>Point 5: Does the company have a worthwhile profit margin?
+
+Why I chose it: As Fisher notes, "Growth is of little value to the investor if it is not accompanied by growing profits." Evaluating the operating margin ensures that the company's business model is fundamentally sound and scalable.
+
+My PASS rule: PASS if the company's operating margin—calculated strictly from recent financial data (2025 onwards)—is greater than or equal to the industry median. FAIL if it falls below the industry standard.
+
+Evidence it uses: The sql_query tool. I designed a comprehensive SQL query to compute the company's margin directly from the orders and monthly_costs tables (filtered for 2025 and later) and compare it against the industry_medians table in a single step.
+
+>Point 7: Does the company have outstanding labor and personnel relations?
+
+Why I chose it: Good labor relations prevent costly strikes, reduce turnover, and boost productivity. Fisher believes that companies with outstanding labor relations possess a significant, often invisible, competitive advantage.
+
+My PASS rule: PASS if the employee mentions good conditions, fair treatment, positive culture, or high morale; FAIL if they complain about bad management, overwork, or poor conditions.
+
+Evidence it uses: The interview tool, specifically querying a "current_employee" about "working_conditions".
+
 
 ### Design
-> a visualization of your agent design and one paragraph describing it.
+```text
+[Input: Company Data] 
+       │
+       ▼
+[LangGraph ReAct Agent (deepseek-v4-flash)] ◄─── [System Prompt: Strict Rules & Pre-built SQL]
+       │
+       ├──► [Tool: interview] ──► Extracts qualitative data for Points 4 & 7
+       │
+       ├──► [Tool: sql_query] ──► Computes margins & avoids LLM math errors for Point 5
+       │
+       ▼
+[Strict JSON Parsing Block] 
+       │
+       ▼
+[Output: {"points": {...}, "summary": "..."}]
+```
+**Description:** 
+The agent is built using LangGraph's `create_react_agent` framework powered by the `deepseek-v4-flash` model (temperature set to 0.0 for deterministic outputs). To eliminate LLM hallucinations—especially arithmetic errors—I injected a highly structured system prompt. Instead of letting the LLM construct complex SQL queries or perform math in its head, the prompt forces the agent to execute a pre-written, bulletproof SQL query that returns both the company and industry margins simultaneously. The agent then simply acts as a logic router: it evaluates the exact retrieved metrics and qualitative interview sentiments against strict criteria, outputting a robust JSON payload equipped with a fallback error-handling mechanism.
 
 ### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+**Score:** 58/60 correct verdicts on `public_test` (Balanced point accuracy: **94.4%**).
+
+**Disagreements:** The agent's verdicts disagreed with the public answers on only two companies: `halcyon_works` and `northwind_group`. In both cases, the disagreement was on **Point 5** (Expected: FAIL, Predicted: PASS).
+
+**Why:** My rule calculates the operating margin strictly for the recent period (2025 onwards) and passes the company if it matches or exceeds the industry median. The ground truth likely uses a different threshold for a "worthwhile" margin, such as requiring a strict multi-year profitability track record or a significantly higher percentage outperformance over the industry median. Because Halcyon and Northwind might have had strong historical margins that skew recent or semi-annual aggregates, my rule flagged them as mathematically passing the baseline industry comparison. To preserve the model's out-of-sample generalization capabilities for the private test set, I chose to maintain this robust, economically sound SQL logic rather than over-engineering the query to force-fit these two edge cases.

@@ -10,9 +10,12 @@ import json
 import sqlite3
 import threading
 import zlib
+import os
 from pathlib import Path
 from typing import Any
 
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
 
 MODEL_NAME = "deepseek-v4-flash"
 INTERVIEW_LIMIT = 10
@@ -57,60 +60,107 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [4, 5, 7]  ### YOUR CODE HERE
 
 
 def build_agent() -> Any:
-    """Create and return your model or agent once.
+    """Create and return your model or agent once."""
 
-    Suggested imports:
-        from langchain_deepseek import ChatDeepSeek
-        from langchain.agents import create_agent
+    # Initialize the LLM using the OpenAI-compatible endpoint
+    llm = ChatOpenAI(
+        model="deepseek-v4-flash",
+        api_key=os.environ.get("DEEPSEEK_API_KEY", "your_key_here"),
+        base_url="https://api.deepseek.com",
+        temperature=0.0  # Keep temperature 0 for maximum deterministic output
+    )
 
-    Use the DeepSeek model named by ``MODEL_NAME``. The API key is loaded
-    from .env. Each company has its own tools (see ``analyze_companies``), so
-    you will probably create one tool-calling agent per company there.
-    """
-    ### YOUR CODE HERE
-    return None
+    # In LangGraph, we can pass the system prompt directly as a plain string.
+    system_prompt = """You are a rigorous financial analyst evaluating companies based on Fisher's framework.
+You must evaluate 3 specific points: Point 4, Point 5, and Point 7.
+
+Rule for Point 4 (Above-average sales organization):
+- Action: Use the `interview` tool. Set role to "customer" and topic to "sales_team".
+- PASS: If the customer indicates the sales team is knowledgeable, helpful, reliable, or provides good advice/solutions. Even mild positive feedback counts as PASS.
+- FAIL: ONLY if there is clear criticism (e.g., they just send price lists, lack technical knowledge, or are unhelpful compared to rivals).
+
+Rule for Point 5 (Worthwhile profit margin):
+- Action: Use `sql_query` to calculate the operating margin ONLY for the last full fiscal year (FY2025). USE EXACTLY THIS QUERY:
+  `SELECT (SELECT operating_margin_pct FROM industry_medians LIMIT 1) AS ind_margin, ROUND((((SELECT SUM(amount) FROM orders WHERE order_date LIKE '2025%') - (SELECT SUM(cost_of_sales) + SUM(selling_admin) + SUM(research_development) FROM monthly_costs WHERE month LIKE '2025%')) * 100.0) / (SELECT SUM(amount) FROM orders WHERE order_date LIKE '2025%'), 2) AS margin_2025;`
+- Verdict: If margin_2025 is GREATER THAN OR EQUAL TO (>=) ind_margin, return PASS. If margin_2025 is less than ind_margin, return FAIL.
+
+Rule for Point 7 (Labour and personnel relations):
+- Action: Use the `interview` tool. Set role to "current_employee" and topic to "working_conditions".
+- PASS: If the employee mentions good conditions, fair treatment, good culture, or high morale.
+- FAIL: If the employee mentions bad conditions, high turnover, overwork, or bad management.
+
+CRITICAL INSTRUCTIONS:
+- You must output your final verdict in valid JSON format.
+- DO NOT wrap the output in markdown blocks like ```json ... ```. Just raw JSON.
+- Format required:
+{
+    "points": {
+        "4": "PASS",
+        "5": "FAIL",
+        "7": "PASS"
+    },
+    "summary": "Brief 1-2 sentence explanation of your verdicts."
+}"""
+
+    return {"llm": llm, "system_prompt": system_prompt}
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
-    """Run your agent and return its verdicts on CHOSEN_POINTS for every company.
+    """Run your agent and return its verdicts on CHOSEN_POINTS for every company."""
 
-    ``companies`` maps each company folder name to its four LangChain tools:
+    llm = agent["llm"]
+    system_prompt = agent["system_prompt"]
+    results = {}
 
-        list_documents()             names and dates of the company's documents
-        read_document(name)          the text of one document
-        sql_query(query)             one read-only SQLite query on company.db
-        interview(role, topic)       one interview answer (INTERVIEW_LIMIT per company)
+    for company_name, tools in companies.items():
+        print(f"Analyzing {company_name}...")
+        try:
+            # 1. 创建 Agent 时，去掉导致报错的 state_modifier 参数
+            agent_executor = create_react_agent(llm, tools)
 
-    Give the tools to a tool-calling agent, e.g.
-    ``create_agent(model, tools=companies[name], system_prompt=...)``, or call
-    them yourself with ``tool.invoke({...})``. The README explains the
-    documents, the database tables and the interview roles and topics.
+            # 2. Invoke 时，直接将 System Prompt 作为第一条系统消息传入
+            # 这种写法完美兼容所有的 LangGraph 版本！
+            response = await agent_executor.ainvoke({
+                "messages": [
+                    ("system", system_prompt),
+                    ("user", "Analyze the company using the provided tools. Ensure final output is valid JSON.")
+                ]
+            })
 
-    Return one dictionary per company folder name, e.g. with
-    CHOSEN_POINTS = [1, 7, 15]:
+            # Extract the final AI response text from the last message in the state
+            output = response["messages"][-1].content.strip()
 
-        {
-            "hollins_group": {
-                "points": {1: "PASS", 7: "FAIL", 15: "PASS"},
-                "summary": "Two or three sentences explaining the verdicts.",
-            },
-            ...
-        }
+            # Clean markdown formatting tags if LLM incorrectly wraps the JSON
+            if output.startswith("```json"):
+                output = output[7:]
+            if output.startswith("```"):
+                output = output[3:]
+            if output.endswith("```"):
+                output = output[:-3]
+            output = output.strip()
 
-    Each chosen point needs a verdict ("PASS" or "FAIL"; True/False also
-    works). Other points are ignored.
+            parsed = json.loads(output)
 
-    Catch errors per company (e.g. a failed API call) and still return an
-    entry for it: an exception here means no results.csv, which scores zero.
-    You may analyse companies in parallel (e.g. ``asyncio.gather``).
-    """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+            # Ensure dictionary keys are integers to satisfy the test runner
+            points_dict = {int(k): v for k, v in parsed.get("points", {}).items()}
+
+            results[company_name] = {
+                "points": points_dict,
+                "summary": parsed.get("summary", "Analysis completed.")
+            }
+        except Exception as e:
+            print(f"Error processing {company_name}: {e}")
+            # Fallback to prevent a single API error from crashing the entire execution
+            results[company_name] = {
+                "points": {4: "FAIL", 5: "FAIL", 7: "FAIL"},
+                "summary": f"Failed due to error: {e}"
+            }
+
+    return results
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
@@ -268,7 +318,7 @@ def point_errors(points: dict[int, str | None], expected: dict[str, Any] | None)
 
 
 def balanced_point_accuracy(
-    analyses: dict[str, Any], truth: dict[str, dict[str, Any]], names: list[str], chosen: list[int]
+        analyses: dict[str, Any], truth: dict[str, dict[str, Any]], names: list[str], chosen: list[int]
 ) -> float:
     """Mean of the accuracy on true-PASS points and on true-FAIL points.
 
@@ -290,7 +340,7 @@ def balanced_point_accuracy(
 
 
 def write_results(
-    names: list[str], analyses: dict[str, Any], truth: dict[str, dict[str, Any]], chosen: list[int]
+        names: list[str], analyses: dict[str, Any], truth: dict[str, dict[str, Any]], chosen: list[int]
 ) -> tuple[Path, int]:
     """Write results.csv and return the number of correct point verdicts."""
     output = Path("results.csv")
